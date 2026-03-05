@@ -2,8 +2,8 @@ name: 自动构建 Uptime Kuma (AMD64 & ARM64)
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '0 0 * * 0'
+#  schedule:
+#    - cron: '0 0 * * 0'
 
 jobs:
   check-version:
@@ -62,8 +62,6 @@ jobs:
         run: |
           VERSION="${{ needs.check-version.outputs.version }}"
           echo "Downloading version: $VERSION"
-          
-          # 在 host 上下载，避免 Docker 内 git 问题
           curl -sL "https://github.com/louislam/uptime-kuma/archive/refs/tags/${VERSION}.tar.gz" -o source.tar.gz
           tar -xzf source.tar.gz
           mv uptime-kuma-* uptime-kuma-src
@@ -85,38 +83,80 @@ jobs:
               set -e
               echo "=== Building for $ARCH ==="
               echo "Architecture: $(uname -m)"
+              echo "Node version: $(node -v)"
               echo "Version: $VERSION"
               
               # 安装编译依赖
               apt-get update
-              apt-get install -y python3 build-essential
+              apt-get install -y python3 build-essential g++ make
               
               # 复制源码
               cp -r /src /build
               cd /build
               
               # 构建前端
-              echo "=== Installing dependencies ==="
+              echo "=== Installing all dependencies ==="
               npm ci --legacy-peer-deps
               
               echo "=== Building frontend ==="
               npm run build
               
-              # 只保留生产依赖
+              # 重新安装生产依赖并强制重新编译原生模块
               echo "=== Reinstalling production only ==="
               rm -rf node_modules
               npm ci --omit=dev --legacy-peer-deps
               
+              # 强制重新编译 sqlite3
+              echo "=== Rebuilding native modules ==="
+              cd node_modules/@louislam/sqlite3
+              npm run build-release
+              cd /build
+              
               # 验证 sqlite3 原生模块
-              echo "=== Checking sqlite3 binding ==="
-              find node_modules -name "node_sqlite3.node" -type f -exec ls -la {} \; || echo "sqlite3 not found!"
+              echo "=== Verifying sqlite3 binding ==="
+              BINDING_PATH=$(find node_modules -name "node_sqlite3.node" -type f 2>/dev/null | head -1)
+              
+              if [ -z "$BINDING_PATH" ]; then
+                echo "[ERROR] sqlite3 binding not found!"
+                echo "Attempting manual rebuild..."
+                
+                # 尝试手动重建
+                npm rebuild @louislam/sqlite3 --build-from-source
+                
+                BINDING_PATH=$(find node_modules -name "node_sqlite3.node" -type f 2>/dev/null | head -1)
+                if [ -z "$BINDING_PATH" ]; then
+                  echo "[FATAL] sqlite3 binding still not found after rebuild!"
+                  exit 1
+                fi
+              fi
+              
+              echo "✓ Found sqlite3 binding: $BINDING_PATH"
+              ls -la "$BINDING_PATH"
+              file "$BINDING_PATH"
+              
+              # 验证架构匹配
+              if [ "$ARCH" = "arm64" ]; then
+                if ! file "$BINDING_PATH" | grep -q "aarch64\|ARM"; then
+                  echo "[ERROR] Binding architecture mismatch!"
+                  file "$BINDING_PATH"
+                  exit 1
+                fi
+                echo "✓ Architecture verified: ARM64"
+              else
+                if ! file "$BINDING_PATH" | grep -q "x86-64\|x86_64"; then
+                  echo "[ERROR] Binding architecture mismatch!"
+                  file "$BINDING_PATH"
+                  exit 1
+                fi
+                echo "✓ Architecture verified: AMD64"
+              fi
               
               # 清理不需要的文件
               echo "=== Cleaning up ==="
-              rm -rf .git .github .vscode test docker
+              rm -rf .git .github .vscode test docker .devcontainer
               rm -f *.md CNAME compose.yaml .dockerignore .editorconfig .gitignore 2>/dev/null || true
               
-              # 清理 node_modules
+              # 清理 node_modules（保留原生模块）
               find node_modules -name "*.md" -type f -delete 2>/dev/null || true
               find node_modules -name "*.map" -type f -delete 2>/dev/null || true
               find node_modules -name "LICENSE*" -type f -delete 2>/dev/null || true
@@ -126,10 +166,23 @@ jobs:
               find node_modules -type d -name "docs" -exec rm -rf {} + 2>/dev/null || true
               find node_modules -type d -name ".github" -exec rm -rf {} + 2>/dev/null || true
               
+              # 不要删除 .node 文件！
+              echo "=== Preserving native modules ==="
+              find node_modules -name "*.node" -type f | head -20
+              
               # 显示大小
               echo "=== Final size ==="
               du -sh .
               du -sh node_modules
+              
+              # 最终验证
+              echo "=== Final verification ==="
+              FINAL_BINDING=$(find node_modules -name "node_sqlite3.node" -type f 2>/dev/null | head -1)
+              if [ -z "$FINAL_BINDING" ]; then
+                echo "[FATAL] sqlite3 binding lost during cleanup!"
+                exit 1
+              fi
+              echo "✓ Final binding: $FINAL_BINDING"
               
               # 复制到输出目录
               mkdir -p /output
@@ -137,6 +190,18 @@ jobs:
               
               echo "=== Done ==="
             '
+      
+      - name: Verify output
+        run: |
+          echo "=== Verifying output ==="
+          BINDING=$(find output -name "node_sqlite3.node" -type f 2>/dev/null | head -1)
+          if [ -z "$BINDING" ]; then
+            echo "[ERROR] No sqlite3 binding in output!"
+            find output -name "*.node" -type f
+            exit 1
+          fi
+          echo "✓ Binding found: $BINDING"
+          file "$BINDING"
       
       - name: Package
         run: |
@@ -150,6 +215,10 @@ jobs:
           cd ..
           
           ls -lh *.tar.gz
+          
+          # 验证打包后的文件
+          echo "=== Verifying package ==="
+          tar -tzf "uptime-kuma-${VERSION}-${ARCH}.tar.gz" | grep "node_sqlite3.node" || echo "[WARN] Binding not in listing"
       
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -191,11 +260,10 @@ jobs:
             - Built frontend (dist/)
             - Server files
             - Production node_modules (架构特定)
-            - Native sqlite3 bindings
+            - Native sqlite3 bindings (已验证)
             
             ## 🚀 Usage
-            适用于内存受限的托管平台。
-          files: |
-            dist/*/*.tar.gz
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            ```bash
+            curl -fsSL <download-url> | tar -xz
+            cd uptime-kuma
+            node server/server.js
