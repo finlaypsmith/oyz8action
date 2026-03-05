@@ -2,8 +2,8 @@ name: 自动构建 Uptime Kuma (AMD64 & ARM64)
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '0 0 * * 0'  # 每周日检查
+#  schedule:
+#    - cron: '0 0 * * 0'  # 每周日检查
 
 jobs:
   check-version:
