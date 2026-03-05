@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: '版本号 (留空自动获取)'
+        description: '版本号 (如 2.2.0，留空自动获取)'
         required: false
         default: ''
 
@@ -23,10 +23,27 @@ jobs:
           if [ -n "${{ github.event.inputs.version }}" ]; then
             VERSION="${{ github.event.inputs.version }}"
           else
-            VERSION=$(curl -s https://api.github.com/repos/louislam/uptime-kuma/releases/latest | grep '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/')
+            # 使用 jq 正确解析 JSON
+            VERSION=$(curl -s https://api.github.com/repos/louislam/uptime-kuma/releases/latest | jq -r '.tag_name')
           fi
+          
+          # 验证版本号格式
+          if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
+            echo "Error: Failed to get version"
+            exit 1
+          fi
+          
+          # 确保版本号看起来正确 (数字.数字.数字)
+          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "Warning: Version '$VERSION' doesn't look like a version number"
+            echo "Fetching manually..."
+            VERSION=$(curl -s https://api.github.com/repos/louislam/uptime-kuma/releases/latest | jq -r '.tag_name')
+          fi
+          
           echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "Building version: $VERSION"
+          echo "========================================"
+          echo "  Building Uptime Kuma v$VERSION"
+          echo "========================================"
       
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -36,9 +53,23 @@ jobs:
       - name: Download source
         run: |
           VERSION="${{ steps.version.outputs.version }}"
-          curl -sL "https://github.com/louislam/uptime-kuma/archive/refs/tags/${VERSION}.tar.gz" -o source.tar.gz
+          echo "Downloading v$VERSION..."
+          
+          URL="https://github.com/louislam/uptime-kuma/archive/refs/tags/${VERSION}.tar.gz"
+          echo "URL: $URL"
+          
+          curl -fSL "$URL" -o source.tar.gz
+          
+          # 验证下载
+          if ! file source.tar.gz | grep -q gzip; then
+            echo "Error: Downloaded file is not gzip"
+            cat source.tar.gz | head -20
+            exit 1
+          fi
+          
           tar -xzf source.tar.gz
           mv uptime-kuma-* uptime-kuma-src
+          echo "✓ Source downloaded"
       
       - name: Build ARM64
         env:
@@ -52,7 +83,7 @@ jobs:
               set -e
               
               echo "=========================================="
-              echo "  ARM64 Build"
+              echo "  ARM64 Build - Uptime Kuma $VERSION"
               echo "  Arch: $(uname -m)"
               echo "  Node: $(node -v)"
               echo "=========================================="
@@ -82,14 +113,10 @@ jobs:
               
               echo ""
               echo "[4/5] Rebuilding sqlite3 for ARM64..."
-              
-              # 方法1: npm rebuild
               npm rebuild @louislam/sqlite3 --build-from-source 2>&1 | tail -10 || true
               
-              # 检查是否成功
               BINDING=$(find node_modules -name "node_sqlite3.node" -type f 2>/dev/null | head -1)
               
-              # 方法2: 如果失败，尝试 node-pre-gyp
               if [ -z "$BINDING" ] || ! file "$BINDING" | grep -qi "aarch64\|ARM"; then
                 echo "Trying node-pre-gyp..."
                 cd node_modules/@louislam/sqlite3
@@ -97,16 +124,7 @@ jobs:
                 cd /build
               fi
               
-              # 方法3: 直接用 node-gyp
-              BINDING=$(find node_modules -name "node_sqlite3.node" -type f 2>/dev/null | head -1)
-              if [ -z "$BINDING" ] || ! file "$BINDING" | grep -qi "aarch64\|ARM"; then
-                echo "Trying node-gyp directly..."
-                cd node_modules/@louislam/sqlite3
-                npx node-gyp rebuild 2>&1 | tail -10 || true
-                cd /build
-              fi
-              
-              echo "✓ sqlite3 rebuild attempted"
+              echo "✓ sqlite3 rebuilt"
               
               echo ""
               echo "[5/5] Verifying..."
@@ -115,8 +133,6 @@ jobs:
               
               if [ -z "$BINDING" ]; then
                 echo "[ERROR] sqlite3 binding not found!"
-                echo "Searching for any .node files:"
-                find node_modules -name "*.node" -type f 2>/dev/null || echo "None found"
                 exit 1
               fi
               
@@ -125,32 +141,22 @@ jobs:
               
               if ! file "$BINDING" | grep -qi "aarch64\|ARM"; then
                 echo "[ERROR] Binding is not ARM64!"
-                file "$BINDING"
                 exit 1
               fi
               
               echo "✓ ARM64 binding verified"
               
               # 清理
-              echo ""
-              echo "Cleaning up..."
               rm -rf .git .github test docker .devcontainer
               rm -f *.md CNAME compose.yaml 2>/dev/null || true
-              find node_modules \( -name "*.md" -o -name "*.map" \) -delete 2>/dev/null || true
-              find node_modules -type d \( -name "test" -o -name "tests" -o -name "docs" \) -exec rm -rf {} + 2>/dev/null || true
               
-              # 再次验证 binding 还在
               FINAL=$(find node_modules -name "node_sqlite3.node" -type f 2>/dev/null | head -1)
-              if [ -z "$FINAL" ]; then
-                echo "[FATAL] Binding was deleted during cleanup!"
-                exit 1
-              fi
+              [ -z "$FINAL" ] && exit 1
               
               echo ""
               echo "=========================================="
               echo "  Build Complete!"
               echo "  Size: $(du -sh . | cut -f1)"
-              echo "  Binding: $FINAL"
               echo "=========================================="
               
               mkdir -p /output
@@ -162,15 +168,13 @@ jobs:
           VERSION="${{ steps.version.outputs.version }}"
           
           BINDING=$(find output -name "node_sqlite3.node" -type f | head -1)
-          echo "Final binding: $BINDING"
+          echo "Binding: $BINDING"
           file "$BINDING"
           
           cd output
           tar -czf "../uptime-kuma-${VERSION}-arm64.tar.gz" uptime-kuma
           cd ..
           
-          echo ""
-          echo "Package: uptime-kuma-${VERSION}-arm64.tar.gz"
           ls -lh *.tar.gz
       
       - name: Upload to Release
