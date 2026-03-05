@@ -23,94 +23,101 @@ jobs:
         id: check
         run: |
           VERSION="${{ steps.version.outputs.version }}"
-          # 检查是否已有两个架构的文件
           RELEASE=$(curl -s https://api.github.com/repos/${{ github.repository }}/releases/tags/$VERSION)
           
           if echo "$RELEASE" | grep -q "uptime-kuma-.*-amd64.tar.gz" && \
              echo "$RELEASE" | grep -q "uptime-kuma-.*-arm64.tar.gz"; then
             echo "should_build=false" >> $GITHUB_OUTPUT
-            echo "Both architectures exist, skipping build"
           else
             echo "should_build=true" >> $GITHUB_OUTPUT
-            echo "Need to build"
           fi
 
   build:
     needs: check-version
     if: needs.check-version.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
           - arch: amd64
-            runner: ubuntu-latest
+            platform: linux/amd64
+            image: node:20-bookworm
           - arch: arm64
-            runner: ubuntu-24.04-arm64
-    
-    runs-on: ${{ matrix.runner }}
+            platform: linux/arm64
+            image: arm64v8/node:20-bookworm
     
     steps:
       - name: Checkout
         uses: actions/checkout@v4
       
-      - name: Setup Node.js
-        uses: actions/setup-node@v4
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
         with:
-          node-version: '20'
+          platforms: arm64
       
-      - name: Clone Uptime Kuma
+      - name: Build in Docker
         run: |
           VERSION="${{ needs.check-version.outputs.version }}"
-          echo "Building version: $VERSION for ${{ matrix.arch }}"
-          git clone --depth 1 --branch $VERSION https://github.com/louislam/uptime-kuma.git
-      
-      - name: Install dependencies and build
-        run: |
-          cd uptime-kuma
-          npm ci --legacy-peer-deps
-          npm run build
-          echo "✓ Frontend built"
-      
-      - name: Reinstall production only
-        run: |
-          cd uptime-kuma
-          rm -rf node_modules
-          npm ci --omit=dev --legacy-peer-deps
+          ARCH="${{ matrix.arch }}"
           
-          # 验证 sqlite3 原生模块
-          echo "=== Checking sqlite3 binding ==="
-          find node_modules -name "node_sqlite3.node" -type f
-      
-      - name: Clean up
-        run: |
-          cd uptime-kuma
+          echo "Building $VERSION for $ARCH"
           
-          # 删除不需要的文件
-          rm -rf .git .github .vscode test docker
-          rm -f *.md CNAME compose.yaml 2>/dev/null || true
-          rm -f .dockerignore .editorconfig .gitignore 2>/dev/null || true
+          docker run --rm --platform ${{ matrix.platform }} \
+            -v $PWD:/workspace \
+            -w /workspace \
+            ${{ matrix.image }} bash -c "
+              set -e
+              echo '=== Building for $ARCH ==='
+              uname -m
+              
+              # 安装编译依赖
+              apt-get update
+              apt-get install -y python3 build-essential git
+              
+              # 克隆
+              git clone --depth 1 --branch $VERSION https://github.com/louislam/uptime-kuma.git
+              cd uptime-kuma
+              
+              # 构建前端
+              npm ci --legacy-peer-deps
+              npm run build
+              echo '✓ Frontend built'
+              
+              # 只保留生产依赖
+              rm -rf node_modules
+              npm ci --omit=dev --legacy-peer-deps
+              
+              # 验证 sqlite3 原生模块
+              echo '=== sqlite3 binding ==='
+              find node_modules -name 'node_sqlite3.node' -type f -exec ls -la {} \;
+              
+              # 清理不需要的文件
+              rm -rf .git .github .vscode test docker
+              rm -f *.md CNAME compose.yaml .dockerignore .editorconfig .gitignore 2>/dev/null || true
+              
+              # 清理 node_modules
+              find node_modules -name '*.md' -type f -delete 2>/dev/null || true
+              find node_modules -name '*.map' -type f -delete 2>/dev/null || true
+              find node_modules -name 'LICENSE*' -type f -delete 2>/dev/null || true
+              find node_modules -name 'CHANGELOG*' -type f -delete 2>/dev/null || true
+              find node_modules -type d -name 'test' -exec rm -rf {} + 2>/dev/null || true
+              find node_modules -type d -name 'tests' -exec rm -rf {} + 2>/dev/null || true
+              find node_modules -type d -name 'docs' -exec rm -rf {} + 2>/dev/null || true
+              find node_modules -type d -name '.github' -exec rm -rf {} + 2>/dev/null || true
+              
+              echo '=== Size ==='
+              du -sh .
+              du -sh node_modules
+              
+              cd ..
+              chown -R 1001:1001 uptime-kuma
+            "
           
-          # 清理 node_modules
-          find node_modules -name "*.md" -type f -delete 2>/dev/null || true
-          find node_modules -name "*.map" -type f -delete 2>/dev/null || true
-          find node_modules -name "LICENSE*" -type f -delete 2>/dev/null || true
-          find node_modules -name "CHANGELOG*" -type f -delete 2>/dev/null || true
-          find node_modules -type d -name "test" -exec rm -rf {} + 2>/dev/null || true
-          find node_modules -type d -name "tests" -exec rm -rf {} + 2>/dev/null || true
-          find node_modules -type d -name "docs" -exec rm -rf {} + 2>/dev/null || true
-          find node_modules -type d -name ".github" -exec rm -rf {} + 2>/dev/null || true
-          
-          echo "=== Final structure ==="
-          ls -la
-          du -sh node_modules
-      
-      - name: Package
-        run: |
-          VERSION="${{ needs.check-version.outputs.version }}"
-          FILENAME="uptime-kuma-${VERSION}-${{ matrix.arch }}.tar.gz"
-          tar -czvf "$FILENAME" uptime-kuma
-          ls -lh "$FILENAME"
-          echo "filename=$FILENAME" >> $GITHUB_ENV
+          # 打包
+          tar -czvf "uptime-kuma-${VERSION}-${ARCH}.tar.gz" uptime-kuma
+          rm -rf uptime-kuma
+          ls -lh *.tar.gz
       
       - name: Upload artifact
         uses: actions/upload-artifact@v4
@@ -127,13 +134,12 @@ jobs:
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
-          path: artifacts
-          merge-multiple: true
+          path: dist
       
       - name: List files
         run: |
-          ls -la artifacts/ || ls -la
-          find . -name "*.tar.gz"
+          find dist -type f -name "*.tar.gz"
+          ls -la dist/*/
       
       - name: Create Release
         uses: softprops/action-gh-release@v1
@@ -147,18 +153,18 @@ jobs:
             
             | Architecture | File |
             |-------------|------|
-            | **AMD64** (x86_64) | `uptime-kuma-${{ needs.check-version.outputs.version }}-amd64.tar.gz` |
-            | **ARM64** (aarch64) | `uptime-kuma-${{ needs.check-version.outputs.version }}-arm64.tar.gz` |
+            | **AMD64** (x86_64, Intel/AMD) | `uptime-kuma-${{ needs.check-version.outputs.version }}-amd64.tar.gz` |
+            | **ARM64** (aarch64, Apple M1/M2, AWS Graviton) | `uptime-kuma-${{ needs.check-version.outputs.version }}-arm64.tar.gz` |
             
             ## ✅ Includes
             - Built frontend (dist/)
             - Server files (server/)
-            - Production node_modules (架构特定)
+            - Production node_modules (架构特定的原生模块)
             - Native sqlite3 bindings
             
-            ## 🚀 For low-memory hosting platforms
+            ## 🚀 Usage
+            适用于内存受限的托管平台，无需本地编译。
           files: |
-            artifacts/*.tar.gz
-          fail_on_unmatched_files: false
+            dist/*/*.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
