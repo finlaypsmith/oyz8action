@@ -1,0 +1,138 @@
+name: 构建 Uptime Kuma ARM64
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号 (例如 2.2.0)'
+        required: false
+        default: ''
+
+jobs:
+  build-arm64:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      
+      - name: Get version
+        id: version
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION=$(curl -s https://api.github.com/repos/louislam/uptime-kuma/releases/latest | grep '"tag_name"' | sed -E 's/.*"([^"]+)".*/\1/')
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Building version: $VERSION"
+      
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+      
+      - name: Download source
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          curl -sL "https://github.com/louislam/uptime-kuma/archive/refs/tags/${VERSION}.tar.gz" -o source.tar.gz
+          tar -xzf source.tar.gz
+          mv uptime-kuma-* uptime-kuma-src
+      
+      - name: Build ARM64
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          docker run --rm --platform linux/arm64 \
+            -v "$PWD/uptime-kuma-src:/src:ro" \
+            -v "$PWD/output:/output" \
+            -e VERSION="$VERSION" \
+            arm64v8/node:20-bookworm bash -c '
+              set -e
+              echo "=== Building ARM64 ==="
+              echo "Arch: $(uname -m)"
+              echo "Node: $(node -v)"
+              
+              apt-get update
+              apt-get install -y python3 build-essential g++ make
+              
+              cp -r /src /build
+              cd /build
+              
+              # 安装全部依赖并构建前端
+              npm ci --legacy-peer-deps
+              npm run build
+              
+              # 重新安装生产依赖
+              rm -rf node_modules
+              npm ci --omit=dev --legacy-peer-deps
+              
+              # 强制重新编译 sqlite3
+              echo "=== Rebuilding sqlite3 ==="
+              cd node_modules/@louislam/sqlite3
+              npm run build-release
+              cd /build
+              
+              # 验证
+              BINDING=$(find node_modules -name "node_sqlite3.node" -type f | head -1)
+              if [ -z "$BINDING" ]; then
+                echo "[ERROR] sqlite3 binding not found!"
+                npm rebuild @louislam/sqlite3 --build-from-source
+                BINDING=$(find node_modules -name "node_sqlite3.node" -type f | head -1)
+              fi
+              
+              if [ -z "$BINDING" ]; then
+                echo "[FATAL] Build failed!"
+                exit 1
+              fi
+              
+              echo "✓ Binding: $BINDING"
+              file "$BINDING"
+              
+              # 验证是 ARM64
+              if ! file "$BINDING" | grep -qi "aarch64\|ARM"; then
+                echo "[ERROR] Wrong architecture!"
+                exit 1
+              fi
+              
+              # 清理
+              rm -rf .git .github test docker .devcontainer
+              rm -f *.md CNAME compose.yaml 2>/dev/null || true
+              find node_modules -name "*.md" -delete 2>/dev/null || true
+              find node_modules -name "*.map" -delete 2>/dev/null || true
+              find node_modules -type d -name "test" -exec rm -rf {} + 2>/dev/null || true
+              find node_modules -type d -name "docs" -exec rm -rf {} + 2>/dev/null || true
+              
+              # 最终验证
+              FINAL=$(find node_modules -name "node_sqlite3.node" -type f | head -1)
+              [ -z "$FINAL" ] && echo "[FATAL] Binding lost!" && exit 1
+              
+              echo "✓ Final: $FINAL"
+              du -sh .
+              
+              mkdir -p /output
+              cp -r /build /output/uptime-kuma
+            '
+      
+      - name: Package
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          
+          # 验证
+          BINDING=$(find output -name "node_sqlite3.node" -type f | head -1)
+          echo "Binding: $BINDING"
+          file "$BINDING"
+          
+          cd output
+          tar -czvf "../uptime-kuma-${VERSION}-arm64.tar.gz" uptime-kuma
+          cd ..
+          
+          ls -lh *.tar.gz
+      
+      - name: Upload to Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ steps.version.outputs.version }}
+          files: uptime-kuma-*-arm64.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
