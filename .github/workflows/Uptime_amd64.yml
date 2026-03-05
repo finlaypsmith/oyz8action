@@ -1,4 +1,4 @@
-name: 自动构建包含 node_modules 的 Uptime Kuma，用于内存受限的托管平台
+name: 构建 Uptime Kuma AMD64
 
 on:
   workflow_dispatch:
