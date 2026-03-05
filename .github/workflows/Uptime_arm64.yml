@@ -4,13 +4,14 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: '版本号 (例如 2.2.0)'
+        description: '版本号 (留空自动获取)'
         required: false
         default: ''
 
 jobs:
   build-arm64:
     runs-on: ubuntu-latest
+    timeout-minutes: 90
     
     steps:
       - name: Checkout
@@ -49,66 +50,108 @@ jobs:
             -e VERSION="$VERSION" \
             arm64v8/node:20-bookworm bash -c '
               set -e
-              echo "=== Building ARM64 ==="
-              echo "Arch: $(uname -m)"
-              echo "Node: $(node -v)"
               
-              apt-get update
-              apt-get install -y python3 build-essential g++ make
+              echo "=========================================="
+              echo "  ARM64 Build"
+              echo "  Arch: $(uname -m)"
+              echo "  Node: $(node -v)"
+              echo "=========================================="
+              
+              apt-get update -qq
+              apt-get install -y -qq python3 build-essential g++ make > /dev/null
+              echo "✓ Build tools installed"
               
               cp -r /src /build
               cd /build
               
-              # 安装全部依赖并构建前端
-              npm ci --legacy-peer-deps
-              npm run build
+              echo ""
+              echo "[1/5] Installing all dependencies..."
+              npm ci --legacy-peer-deps 2>&1 | tail -5
+              echo "✓ Dependencies installed"
               
-              # 重新安装生产依赖
+              echo ""
+              echo "[2/5] Building frontend..."
+              npm run build 2>&1 | tail -5
+              echo "✓ Frontend built"
+              
+              echo ""
+              echo "[3/5] Reinstalling production deps..."
               rm -rf node_modules
-              npm ci --omit=dev --legacy-peer-deps
+              npm ci --omit=dev --legacy-peer-deps 2>&1 | tail -5
+              echo "✓ Production deps installed"
               
-              # 强制重新编译 sqlite3
-              echo "=== Rebuilding sqlite3 ==="
-              cd node_modules/@louislam/sqlite3
-              npm run build-release
-              cd /build
+              echo ""
+              echo "[4/5] Rebuilding sqlite3 for ARM64..."
               
-              # 验证
-              BINDING=$(find node_modules -name "node_sqlite3.node" -type f | head -1)
+              # 方法1: npm rebuild
+              npm rebuild @louislam/sqlite3 --build-from-source 2>&1 | tail -10 || true
+              
+              # 检查是否成功
+              BINDING=$(find node_modules -name "node_sqlite3.node" -type f 2>/dev/null | head -1)
+              
+              # 方法2: 如果失败，尝试 node-pre-gyp
+              if [ -z "$BINDING" ] || ! file "$BINDING" | grep -qi "aarch64\|ARM"; then
+                echo "Trying node-pre-gyp..."
+                cd node_modules/@louislam/sqlite3
+                npx node-pre-gyp rebuild --build-from-source 2>&1 | tail -10 || true
+                cd /build
+              fi
+              
+              # 方法3: 直接用 node-gyp
+              BINDING=$(find node_modules -name "node_sqlite3.node" -type f 2>/dev/null | head -1)
+              if [ -z "$BINDING" ] || ! file "$BINDING" | grep -qi "aarch64\|ARM"; then
+                echo "Trying node-gyp directly..."
+                cd node_modules/@louislam/sqlite3
+                npx node-gyp rebuild 2>&1 | tail -10 || true
+                cd /build
+              fi
+              
+              echo "✓ sqlite3 rebuild attempted"
+              
+              echo ""
+              echo "[5/5] Verifying..."
+              
+              BINDING=$(find node_modules -name "node_sqlite3.node" -type f 2>/dev/null | head -1)
+              
               if [ -z "$BINDING" ]; then
                 echo "[ERROR] sqlite3 binding not found!"
-                npm rebuild @louislam/sqlite3 --build-from-source
-                BINDING=$(find node_modules -name "node_sqlite3.node" -type f | head -1)
-              fi
-              
-              if [ -z "$BINDING" ]; then
-                echo "[FATAL] Build failed!"
+                echo "Searching for any .node files:"
+                find node_modules -name "*.node" -type f 2>/dev/null || echo "None found"
                 exit 1
               fi
               
-              echo "✓ Binding: $BINDING"
+              echo "Found: $BINDING"
               file "$BINDING"
               
-              # 验证是 ARM64
               if ! file "$BINDING" | grep -qi "aarch64\|ARM"; then
-                echo "[ERROR] Wrong architecture!"
+                echo "[ERROR] Binding is not ARM64!"
+                file "$BINDING"
                 exit 1
               fi
               
+              echo "✓ ARM64 binding verified"
+              
               # 清理
+              echo ""
+              echo "Cleaning up..."
               rm -rf .git .github test docker .devcontainer
               rm -f *.md CNAME compose.yaml 2>/dev/null || true
-              find node_modules -name "*.md" -delete 2>/dev/null || true
-              find node_modules -name "*.map" -delete 2>/dev/null || true
-              find node_modules -type d -name "test" -exec rm -rf {} + 2>/dev/null || true
-              find node_modules -type d -name "docs" -exec rm -rf {} + 2>/dev/null || true
+              find node_modules \( -name "*.md" -o -name "*.map" \) -delete 2>/dev/null || true
+              find node_modules -type d \( -name "test" -o -name "tests" -o -name "docs" \) -exec rm -rf {} + 2>/dev/null || true
               
-              # 最终验证
-              FINAL=$(find node_modules -name "node_sqlite3.node" -type f | head -1)
-              [ -z "$FINAL" ] && echo "[FATAL] Binding lost!" && exit 1
+              # 再次验证 binding 还在
+              FINAL=$(find node_modules -name "node_sqlite3.node" -type f 2>/dev/null | head -1)
+              if [ -z "$FINAL" ]; then
+                echo "[FATAL] Binding was deleted during cleanup!"
+                exit 1
+              fi
               
-              echo "✓ Final: $FINAL"
-              du -sh .
+              echo ""
+              echo "=========================================="
+              echo "  Build Complete!"
+              echo "  Size: $(du -sh . | cut -f1)"
+              echo "  Binding: $FINAL"
+              echo "=========================================="
               
               mkdir -p /output
               cp -r /build /output/uptime-kuma
@@ -118,15 +161,16 @@ jobs:
         run: |
           VERSION="${{ steps.version.outputs.version }}"
           
-          # 验证
           BINDING=$(find output -name "node_sqlite3.node" -type f | head -1)
-          echo "Binding: $BINDING"
+          echo "Final binding: $BINDING"
           file "$BINDING"
           
           cd output
-          tar -czvf "../uptime-kuma-${VERSION}-arm64.tar.gz" uptime-kuma
+          tar -czf "../uptime-kuma-${VERSION}-arm64.tar.gz" uptime-kuma
           cd ..
           
+          echo ""
+          echo "Package: uptime-kuma-${VERSION}-arm64.tar.gz"
           ls -lh *.tar.gz
       
       - name: Upload to Release
