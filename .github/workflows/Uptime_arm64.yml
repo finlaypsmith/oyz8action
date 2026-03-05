@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: '版本号 (如 2.2.0，留空自动获取)'
+        description: '版本号 (如 2.2.0)'
         required: false
         default: ''
 
@@ -23,27 +23,16 @@ jobs:
           if [ -n "${{ github.event.inputs.version }}" ]; then
             VERSION="${{ github.event.inputs.version }}"
           else
-            # 使用 jq 正确解析 JSON
             VERSION=$(curl -s https://api.github.com/repos/louislam/uptime-kuma/releases/latest | jq -r '.tag_name')
           fi
           
-          # 验证版本号格式
           if [ -z "$VERSION" ] || [ "$VERSION" = "null" ]; then
             echo "Error: Failed to get version"
             exit 1
           fi
           
-          # 确保版本号看起来正确 (数字.数字.数字)
-          if ! echo "$VERSION" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-            echo "Warning: Version '$VERSION' doesn't look like a version number"
-            echo "Fetching manually..."
-            VERSION=$(curl -s https://api.github.com/repos/louislam/uptime-kuma/releases/latest | jq -r '.tag_name')
-          fi
-          
           echo "version=$VERSION" >> $GITHUB_OUTPUT
-          echo "========================================"
-          echo "  Building Uptime Kuma v$VERSION"
-          echo "========================================"
+          echo "Building version: $VERSION"
       
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -53,23 +42,9 @@ jobs:
       - name: Download source
         run: |
           VERSION="${{ steps.version.outputs.version }}"
-          echo "Downloading v$VERSION..."
-          
-          URL="https://github.com/louislam/uptime-kuma/archive/refs/tags/${VERSION}.tar.gz"
-          echo "URL: $URL"
-          
-          curl -fSL "$URL" -o source.tar.gz
-          
-          # 验证下载
-          if ! file source.tar.gz | grep -q gzip; then
-            echo "Error: Downloaded file is not gzip"
-            cat source.tar.gz | head -20
-            exit 1
-          fi
-          
+          curl -fSL "https://github.com/louislam/uptime-kuma/archive/refs/tags/${VERSION}.tar.gz" -o source.tar.gz
           tar -xzf source.tar.gz
           mv uptime-kuma-* uptime-kuma-src
-          echo "✓ Source downloaded"
       
       - name: Build ARM64
         env:
@@ -79,64 +54,86 @@ jobs:
             -v "$PWD/uptime-kuma-src:/src:ro" \
             -v "$PWD/output:/output" \
             -e VERSION="$VERSION" \
-            arm64v8/node:20-bookworm bash -c '
+            arm64v8/node:18-bookworm bash -c '
               set -e
               
               echo "=========================================="
-              echo "  ARM64 Build - Uptime Kuma $VERSION"
+              echo "  ARM64 Build - Uptime Kuma"
               echo "  Arch: $(uname -m)"
               echo "  Node: $(node -v)"
               echo "=========================================="
               
+              # 安装编译工具
               apt-get update -qq
-              apt-get install -y -qq python3 build-essential g++ make > /dev/null
+              apt-get install -y -qq python3 build-essential g++ make file > /dev/null
               echo "✓ Build tools installed"
               
               cp -r /src /build
               cd /build
               
               echo ""
-              echo "[1/5] Installing all dependencies..."
+              echo "[1/6] Installing all dependencies..."
               npm ci --legacy-peer-deps 2>&1 | tail -5
               echo "✓ Dependencies installed"
               
               echo ""
-              echo "[2/5] Building frontend..."
+              echo "[2/6] Building frontend..."
               npm run build 2>&1 | tail -5
               echo "✓ Frontend built"
               
               echo ""
-              echo "[3/5] Reinstalling production deps..."
+              echo "[3/6] Removing node_modules..."
               rm -rf node_modules
+              
+              echo ""
+              echo "[4/6] Installing production deps..."
               npm ci --omit=dev --legacy-peer-deps 2>&1 | tail -5
               echo "✓ Production deps installed"
               
               echo ""
-              echo "[4/5] Rebuilding sqlite3 for ARM64..."
-              npm rebuild @louislam/sqlite3 --build-from-source 2>&1 | tail -10 || true
+              echo "[5/6] Rebuilding sqlite3 for ARM64..."
               
-              BINDING=$(find node_modules -name "node_sqlite3.node" -type f 2>/dev/null | head -1)
+              # 进入 sqlite3 目录重新编译
+              cd node_modules/@louislam/sqlite3
               
-              if [ -z "$BINDING" ] || ! file "$BINDING" | grep -qi "aarch64\|ARM"; then
-                echo "Trying node-pre-gyp..."
-                cd node_modules/@louislam/sqlite3
-                npx node-pre-gyp rebuild --build-from-source 2>&1 | tail -10 || true
-                cd /build
-              fi
+              # 查看当前状态
+              echo "Current binding directory:"
+              ls -la lib/binding/ 2>/dev/null || echo "No binding dir yet"
               
-              echo "✓ sqlite3 rebuilt"
+              # 使用 node-pre-gyp 重新编译
+              npx --yes node-pre-gyp rebuild --build-from-source 2>&1 | tail -20
+              
+              # 检查编译结果
+              echo ""
+              echo "After rebuild:"
+              find . -name "*.node" -type f 2>/dev/null
+              ls -la lib/binding/ 2>/dev/null || true
+              
+              cd /build
               
               echo ""
-              echo "[5/5] Verifying..."
+              echo "[6/6] Verifying ARM64 binding..."
+              
+              # 查找 binding 文件
+              echo "Searching for node_sqlite3.node..."
+              find node_modules -name "node_sqlite3.node" -type f 2>/dev/null
               
               BINDING=$(find node_modules -name "node_sqlite3.node" -type f 2>/dev/null | head -1)
               
               if [ -z "$BINDING" ]; then
+                echo ""
                 echo "[ERROR] sqlite3 binding not found!"
+                echo ""
+                echo "All .node files:"
+                find node_modules -name "*.node" -type f 2>/dev/null
+                echo ""
+                echo "sqlite3 directory structure:"
+                ls -laR node_modules/@louislam/sqlite3/lib/ 2>/dev/null || true
                 exit 1
               fi
               
-              echo "Found: $BINDING"
+              echo ""
+              echo "Found binding: $BINDING"
               file "$BINDING"
               
               if ! file "$BINDING" | grep -qi "aarch64\|ARM"; then
@@ -144,14 +141,35 @@ jobs:
                 exit 1
               fi
               
+              # 确认路径正确
+              EXPECTED_PATH="node_modules/@louislam/sqlite3/lib/binding/napi-v6-linux-arm64/node_sqlite3.node"
+              if [ ! -f "$EXPECTED_PATH" ]; then
+                echo ""
+                echo "[WARN] Binding not in expected path, creating..."
+                mkdir -p "$(dirname $EXPECTED_PATH)"
+                cp "$BINDING" "$EXPECTED_PATH"
+                echo "✓ Copied to $EXPECTED_PATH"
+              fi
+              
               echo "✓ ARM64 binding verified"
               
-              # 清理
+              # 清理（小心不要删除 binding）
+              echo ""
+              echo "Cleaning up..."
               rm -rf .git .github test docker .devcontainer
               rm -f *.md CNAME compose.yaml 2>/dev/null || true
               
-              FINAL=$(find node_modules -name "node_sqlite3.node" -type f 2>/dev/null | head -1)
-              [ -z "$FINAL" ] && exit 1
+              # 最终验证
+              echo ""
+              echo "Final verification:"
+              FINAL_BINDING="node_modules/@louislam/sqlite3/lib/binding/napi-v6-linux-arm64/node_sqlite3.node"
+              if [ ! -f "$FINAL_BINDING" ]; then
+                echo "[FATAL] Binding missing after cleanup!"
+                exit 1
+              fi
+              
+              ls -la "$FINAL_BINDING"
+              file "$FINAL_BINDING"
               
               echo ""
               echo "=========================================="
@@ -163,13 +181,23 @@ jobs:
               cp -r /build /output/uptime-kuma
             '
       
+      - name: Verify output
+        run: |
+          echo "Checking output..."
+          BINDING="output/uptime-kuma/node_modules/@louislam/sqlite3/lib/binding/napi-v6-linux-arm64/node_sqlite3.node"
+          
+          if [ ! -f "$BINDING" ]; then
+            echo "ERROR: Binding not found in output!"
+            find output -name "*.node" -type f
+            exit 1
+          fi
+          
+          echo "✓ Binding exists: $BINDING"
+          file "$BINDING"
+      
       - name: Package
         run: |
           VERSION="${{ steps.version.outputs.version }}"
-          
-          BINDING=$(find output -name "node_sqlite3.node" -type f | head -1)
-          echo "Binding: $BINDING"
-          file "$BINDING"
           
           cd output
           tar -czf "../uptime-kuma-${VERSION}-arm64.tar.gz" uptime-kuma
