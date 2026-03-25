@@ -2,7 +2,7 @@ name: KataBump 自动续订
 
 on:
   schedule:
-    - cron: '0 8 * * *'
+    - cron: '21 7 * * *'
   workflow_dispatch:
     inputs:
       force_renew:
@@ -120,8 +120,9 @@ jobs:
 
       - name: 运行续订脚本
         env:
-          KATA_USERNAME: ${{ secrets.KATA_EMAIL }}
+          KATA_EMAIL: ${{ secrets.KATA_EMAIL }}
           KATA_PASSWORD: ${{ secrets.KATA_PASSWORD }}
+          KATA_SERVER_ID: ${{ secrets.KATA_SERVER_ID }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           FORCE_RENEW: ${{ github.event.inputs.force_renew || 'false' }}
