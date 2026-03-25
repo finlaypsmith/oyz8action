@@ -56,9 +56,9 @@ jobs:
       - name: 安装 Python 依赖
         run: |
           pip install --upgrade pip
-          pip install seleniumbase pyvirtualdisplay
-          seleniumbase install chromedriver
-          seleniumbase install chrome
+          pip install playwright requests
+          playwright install chromium
+          playwright install-deps chromium
 
       - name: 下载 Hysteria2
         run: |
@@ -125,8 +125,10 @@ jobs:
           KATA_SERVER_ID: ${{ secrets.KATA_SERVER_ID }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          CAPSOLVER_KEY: ${{ secrets.CAPSOLVER_KEY }}
           FORCE_RENEW: ${{ github.event.inputs.force_renew || 'false' }}
           PROXY_SERVER: "http://127.0.0.1:8080"
+          SCREENSHOT_DIR: "/tmp"
         run: |
           export DISPLAY=:99
           Xvfb :99 -screen 0 1920x1080x24 > /dev/null 2>&1 &
